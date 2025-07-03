@@ -32,12 +32,13 @@
     "GITHUB_USERNAME": "your-username",
     "HEALTHY_THRESHOLD": "15",
     "MODERATE_THRESHOLD": "5",
+    "MONITORING_DAYS": "7",
     "CACHE_TTL": "86400",
     "JST_UPDATE_HOUR": "8",
     "INCLUDE_ORG_REPOS": "false",
     "MAX_REPOS_PER_ORG": "5",
     "EXCLUDE_REPOS": "",
-    "EXCLUDE_ORGS": "",
+    "EXCLUDE_ORGS": ""
     // "GITHUB_TOKEN": "ghp_xxxxxxxxxxxx" // Personal Access Token (推奨)
   }
   /**

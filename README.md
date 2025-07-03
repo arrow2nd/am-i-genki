@@ -45,7 +45,7 @@ npx wrangler kv namespace create "AM_I_GENKI_CACHE"
     "GITHUB_USERNAME": "your-github-username",  // 必須：監視対象のGitHubユーザー名
     "HEALTHY_THRESHOLD": "15",     // 元気判定のしきい値（デフォルト: 15）
     "MODERATE_THRESHOLD": "5",     // そこそこ判定のしきい値（デフォルト: 5）
-    "MONITORING_DAYS": "14",      // 監視期間（日数、デフォルト: 14日間）
+    "MONITORING_DAYS": "7",      // 監視期間（日数、デフォルト: 7日間）
     "CACHE_TTL": "86400",         // キャッシュ保持時間（秒、デフォルト: 24時間）
     "JST_UPDATE_HOUR": "8",       // JST更新時刻（0-23、デフォルト: 朝8時）
     "INCLUDE_ORG_REPOS": "false", // 組織リポジトリを含むか（デフォルト: false）
