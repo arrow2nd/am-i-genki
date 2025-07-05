@@ -60,6 +60,54 @@ function getGithubHeaders(token?: string): HeadersInit {
   return headers;
 }
 
+// リトライ付きfetch関数
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries: number = 3,
+  initialDelay: number = 1000,
+): Promise<Response> {
+  let lastError: Error | null = null;
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(url, options);
+
+      // レート制限のチェック
+      if (response.status === 429 || response.status === 403) {
+        const retryAfter = response.headers.get("retry-after");
+        const waitTime = retryAfter
+          ? parseInt(retryAfter) * 1000
+          : initialDelay * Math.pow(2, i);
+
+        console.warn(`Rate limited. Waiting ${waitTime}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        continue;
+      }
+
+      // 5xxエラーの場合はリトライ
+      if (response.status >= 500) {
+        const waitTime = initialDelay * Math.pow(2, i);
+        console.warn(
+          `Server error ${response.status}. Retrying in ${waitTime}ms...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+        continue;
+      }
+
+      return response;
+    } catch (error) {
+      lastError = error as Error;
+      const waitTime = initialDelay * Math.pow(2, i);
+      console.error(`Network error: ${error}. Retrying in ${waitTime}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
+    }
+  }
+
+  throw lastError ||
+    new Error(`Failed to fetch ${url} after ${maxRetries} retries`);
+}
+
 // Botアカウントかどうかを判定
 function isBotAccount(login?: string, name?: string, email?: string): boolean {
   if (!login && !name && !email) return false;
@@ -92,12 +140,12 @@ async function getRepoCommits(
   token?: string,
 ): Promise<number> {
   try {
-    const commitsResponse = await fetch(
+    const commitsResponse = await fetchWithRetry(
       `https://api.github.com/repos/${repoOwner}/${repoName}/commits?author=${username}&since=${since.toISOString()}&per_page=100`,
       { headers: getGithubHeaders(token) },
+      3,
+      500,
     );
-
-    console.log(commitsResponse.url);
 
     if (commitsResponse.ok) {
       const commits = await commitsResponse.json() as Array<{
@@ -124,7 +172,6 @@ async function getRepoCommits(
           !isMergeCommit &&
           authorLogin === username;
       });
-      console.log(userCommits);
 
       return userCommits.length;
     }
@@ -147,12 +194,10 @@ async function getOrgRepoCommits(
 
   try {
     // ユーザーが所属する組織を取得
-    const orgsResponse = await fetch(
+    const orgsResponse = await fetchWithRetry(
       `https://api.github.com/users/${username}/orgs`,
       { headers: getGithubHeaders(config.githubToken) },
     );
-
-    console.log(orgsResponse.url);
 
     if (!orgsResponse.ok) {
       console.error("Failed to fetch user organizations");
@@ -161,75 +206,103 @@ async function getOrgRepoCommits(
 
     const orgs = await orgsResponse.json() as Array<{ login: string }>;
 
-    for (const org of orgs) {
-      if (processedOrgRepos >= maxRepos) break;
+    // 除外組織をフィルタリング
+    const filteredOrgs = orgs.filter((org) =>
+      !config.excludeOrgs.includes(org.login)
+    );
 
-      // 除外組織をスキップ
-      if (config.excludeOrgs.includes(org.login)) {
-        continue;
-      }
-
+    // 組織ごとのリポジトリを並列取得
+    const orgReposPromises = filteredOrgs.map(async (org) => {
       try {
-        // 組織のパブリックリポジトリを取得
-        const orgReposResponse = await fetch(
+        const orgReposResponse = await fetchWithRetry(
           `https://api.github.com/orgs/${org.login}/repos?type=public&sort=updated&per_page=${config.maxReposPerOrg}`,
           { headers: getGithubHeaders(config.githubToken) },
         );
 
-        console.log(orgReposResponse.url);
-
         if (orgReposResponse.ok) {
-          const orgRepos = await orgReposResponse.json() as Array<{
+          const repos = await orgReposResponse.json() as Array<{
             name: string;
             updated_at: string;
           }>;
-
-          for (const repo of orgRepos) {
-            console.log(repo.name, repo.updated_at);
-            if (processedOrgRepos >= maxRepos) break;
-
-            console.log("Processing repo:", repo.name);
-
-            // 除外リポジトリをスキップ
-            if (config.excludeRepos.includes(repo.name)) {
-              continue;
-            }
-
-            const repoUpdated = new Date(repo.updated_at);
-            if (repoUpdated < since) {
-              continue;
-            }
-
-            // このリポジトリにユーザーがコミットしているかチェック
-            const commits = await getRepoCommits(
-              username,
-              org.login,
-              repo.name,
-              since,
-              config.githubToken,
-            );
-
-            if (commits > 0) {
-              totalOrgCommits += commits;
-              processedOrgRepos++;
-            }
-
-            // レート制限対策
-            await new Promise((resolve) =>
-              setTimeout(resolve, config.githubToken ? 50 : 100)
-            );
-          }
-        } else {
-          console.error(await orgReposResponse.json());
-          continue;
+          return { org: org.login, repos };
         }
+        return null;
+      } catch (error) {
+        console.error(`Error fetching repos for org ${org.login}:`, error);
+        return null;
+      }
+    });
 
+    const orgReposResults = await Promise.all(orgReposPromises);
+
+    // 全てのリポジトリをフラット化して処理
+    const allOrgRepos: Array<
+      { org: string; repo: { name: string; updated_at: string } }
+    > = [];
+
+    for (const result of orgReposResults) {
+      if (result && result.repos) {
+        for (const repo of result.repos) {
+          if (allOrgRepos.length >= maxRepos) break;
+
+          const repoUpdated = new Date(repo.updated_at);
+          if (
+            repoUpdated >= since && !config.excludeRepos.includes(repo.name)
+          ) {
+            allOrgRepos.push({ org: result.org, repo });
+          }
+        }
+      }
+    }
+
+    // バッチサイズ
+    const batchSize = config.githubToken ? 5 : 3;
+
+    // バッチ処理でコミット数を確認
+    for (
+      let i = 0;
+      i < allOrgRepos.length && processedOrgRepos < maxRepos;
+      i += batchSize
+    ) {
+      const batch = allOrgRepos.slice(
+        i,
+        Math.min(i + batchSize, allOrgRepos.length),
+      );
+
+      const batchPromises = batch.map(async ({ org, repo }) => {
+        try {
+          const commits = await getRepoCommits(
+            username,
+            org,
+            repo.name,
+            since,
+            config.githubToken,
+          );
+
+          if (commits > 0) {
+            return { commits, org, repo: repo.name };
+          }
+          return null;
+        } catch (error) {
+          console.error(`Error processing ${org}/${repo.name}:`, error);
+          return null;
+        }
+      });
+
+      const results = await Promise.all(batchPromises);
+
+      for (const result of results) {
+        if (result && processedOrgRepos < maxRepos) {
+          totalOrgCommits += result.commits;
+          processedOrgRepos++;
+        }
+      }
+
+      // バッチ間の小さな遅延
+      if (i + batchSize < allOrgRepos.length && processedOrgRepos < maxRepos) {
         await new Promise((resolve) =>
           setTimeout(resolve, config.githubToken ? 100 : 200)
         );
-      } catch (error) {
-        console.error(`Error processing org ${org.login}:`, error);
-        continue;
       }
     }
   } catch (error) {
@@ -254,7 +327,7 @@ async function getCommitCount(
   const repoSources = { owned: 0, org: 0 };
 
   // ユーザーの所有リポジトリを取得・処理
-  const ownedRepos = await fetch(
+  const ownedRepos = await fetchWithRetry(
     `https://api.github.com/users/${username}/repos?type=owner&sort=updated&per_page=30`,
     { headers: getGithubHeaders(config.githubToken) },
   );
@@ -265,39 +338,61 @@ async function getCommitCount(
       updated_at: string;
     }>;
 
-    for (const repo of repos) {
-      if (processedRepos >= 20) break; // 全体で最大20リポジトリ
+    // 処理対象のリポジトリをフィルタリング
+    const reposToProcess = repos
+      .filter((repo) => {
+        if (processedRepos >= 20) return false;
+        if (config.excludeRepos.includes(repo.name)) return false;
+        const repoUpdated = new Date(repo.updated_at);
+        return repoUpdated >= since;
+      })
+      .slice(0, 20);
 
-      // 除外リポジトリをスキップ
-      if (config.excludeRepos.includes(repo.name)) {
-        continue;
+    // バッチサイズ（同時実行数）
+    const batchSize = config.githubToken ? 5 : 3;
+
+    // バッチ処理で並列化
+    for (let i = 0; i < reposToProcess.length; i += batchSize) {
+      const batch = reposToProcess.slice(i, i + batchSize);
+
+      const batchPromises = batch.map(async (repo) => {
+        try {
+          const commits = await getRepoCommits(
+            username,
+            username,
+            repo.name,
+            since,
+            config.githubToken,
+          );
+
+          if (commits > 0) {
+            return { commits, isOwned: true };
+          }
+          return null;
+        } catch (error) {
+          console.error(`Error processing repo ${repo.name}:`, error);
+          return null;
+        }
+      });
+
+      const results = await Promise.all(batchPromises);
+
+      for (const result of results) {
+        if (result) {
+          totalCommits += result.commits;
+          repoSources.owned++;
+          processedRepos++;
+        }
       }
 
-      const repoUpdated = new Date(repo.updated_at);
-      if (repoUpdated < since) continue;
-
-      const commits = await getRepoCommits(
-        username,
-        username,
-        repo.name,
-        since,
-        config.githubToken,
-      );
-
-      if (commits > 0) {
-        totalCommits += commits;
-        repoSources.owned++;
-        processedRepos++;
+      // バッチ間の小さな遅延
+      if (i + batchSize < reposToProcess.length) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, config.githubToken ? 100 : 200)
+        );
       }
-
-      // レート制限対策
-      await new Promise((resolve) =>
-        setTimeout(resolve, config.githubToken ? 50 : 100)
-      );
     }
   }
-
-  console.log(processedRepos, totalCommits);
 
   // 組織リポジトリも含める場合
   if (config.includeOrgRepos && processedRepos < 20) {
@@ -397,6 +492,57 @@ function shouldUpdateCache(
   return false;
 }
 
+// バックグラウンド更新関数
+async function updateCacheInBackground(
+  env: Env,
+  config: ReturnType<typeof getConfig>,
+  cacheKey: string,
+) {
+  try {
+    // Botユーザーチェック（簡易チェック）
+    if (isBotAccount(config.username)) {
+      console.error("Bot users are not supported");
+      return;
+    }
+
+    // 新規データ取得
+    const result = await getCommitCount(
+      config.username,
+      config.monitoringDays,
+      config,
+    );
+
+    const status = getHealthStatus(
+      result.commits,
+      config.healthyThreshold,
+      config.moderateThreshold,
+    );
+
+    const data: CacheData = {
+      commits: result.commits,
+      status,
+      lastUpdated: new Date().toISOString(),
+      sources: result.sources,
+    };
+
+    // キャッシュ保存
+    await env.AM_I_GENKI_CACHE.put(cacheKey, JSON.stringify(data), {
+      expirationTtl: config.cacheTTL,
+    });
+
+    console.log(`Cache updated successfully for ${config.username}`);
+  } catch (error) {
+    console.error("Background cache update failed:", error);
+    // エラーの詳細をログに出力
+    if (error instanceof Error) {
+      console.error("Error details:", {
+        message: error.message,
+        stack: error.stack,
+      });
+    }
+  }
+}
+
 // メインエンドポイント：バッジ取得
 app.get("/badge", async (c) => {
   const env = c.env;
@@ -416,11 +562,19 @@ app.get("/badge", async (c) => {
 
     let data: CacheData;
 
-    if (
-      cached && !shouldUpdateCache(cached.lastUpdated, config.jstUpdateHour)
-    ) {
+    if (cached) {
+      // キャッシュがある場合は常に返す（SWR）
       data = cached;
+
+      // 更新が必要な場合はバックグラウンドで更新
+      if (shouldUpdateCache(cached.lastUpdated, config.jstUpdateHour)) {
+        // waitUntilを使ってバックグラウンド処理を実行
+        c.executionCtx.waitUntil(
+          updateCacheInBackground(env, config, cacheKey),
+        );
+      }
     } else {
+      // キャッシュがない場合は同期的に取得
       // Botユーザーチェック（簡易チェック）
       if (isBotAccount(config.username)) {
         return c.text("Bot users are not supported", 400);
