@@ -71,3 +71,4 @@ export type BadgeStyle = typeof VALID_BADGE_STYLES[number];
 
 // 元気度ステータスの型定義
 export type HealthStatus = "healthy" | "moderate" | "inactive";
+

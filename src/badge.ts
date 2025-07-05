@@ -1,5 +1,5 @@
 import { makeBadge } from "badge-maker";
-import type { HealthStatus, BadgeStyle, VALID_BADGE_STYLES } from "./types";
+import { BadgeStyle, HealthStatus, VALID_BADGE_STYLES } from "./types";
 
 // バッジスタイルの検証
 export function isValidBadgeStyle(style: string): style is BadgeStyle {
@@ -29,3 +29,4 @@ export function generateBadgeSVG(
     style,
   });
 }
+
